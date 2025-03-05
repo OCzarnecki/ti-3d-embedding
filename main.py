@@ -1,9 +1,15 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Generic, TypeVar, Literal, Any
+from itertools import repeat
+from collections import defaultdict
+
+import math
 
 from tqdm.auto import tqdm
 from matplotlib.axes import Axes
+from mpl_toolkits.mplot3d.axes3d import Axes3D
 from functools import cache
+from PIL import Image
 
 import numpy as np
 import numpy.typing as npt
@@ -64,6 +70,7 @@ class Graph(Generic[NodeMeta, EdgeMeta]):
             if not 0 <= edge.i < self.num_nodes:
                 raise IndexError(f"Edge {edge} out of range")
 
+    @cache
     def adj_matrix(self) -> npt.NDArray:
         matrix = np.zeros((self.num_nodes, self.num_nodes))
         for edge in self.edges:
@@ -88,6 +95,21 @@ class Graph(Generic[NodeMeta, EdgeMeta]):
                         distances[u, v] = via_edge_rev
         return distances
 
+    @cache
+    def to_index_mapping(self) -> dict[NodeMeta, int]:
+        return {
+            node: idx
+            for idx, node in enumerate(self.node_meta)
+        }
+
+    @cache
+    def adj_list(self) -> dict[NodeMeta, list[NodeMeta]]:
+        adj_list = defaultdict(list)
+        for edge in self.edges:
+            adj_list[self.node_meta[edge.i]].append(self.node_meta[edge.j])
+            adj_list[self.node_meta[edge.j]].append(self.node_meta[edge.i])
+        return adj_list
+
     def plot_2d(
         self,
         ax: Axes,
@@ -108,6 +130,70 @@ class Graph(Generic[NodeMeta, EdgeMeta]):
                 )
             )
         return artists
+
+    def plot_3d(
+        self,
+        ax: Axes3D,
+        positions: npt.NDArray[np.float64],
+        edge_kwargs: dict[str, Any] | None = None,
+    ):
+        if edge_kwargs is None:
+            edge_kwargs = {}
+
+        artists = []
+
+        for idx, node in enumerate(self.node_meta):
+            x1, y1, z1 = positions[:, idx]
+            x2, y2, z2 = [x1, y1, 0.0]
+            artists += (
+                ax.plot(
+                    [x1, x2], [y1, y2], [z1, z2],
+                    **edge_kwargs,
+                    color="grey",
+                )
+            )
+
+        for edge in self.edges:
+            x1, y1, z1 = positions[:, edge.i]
+            x2, y2, z2 = positions[:, edge.j]
+            artists += (
+                ax.plot(
+                    [x1, x2], [y1, y2], [z1, z2],
+                    **edge_kwargs,
+                )
+            )
+
+        return artists
+
+    @cache
+    def get_triangle_indices(self):
+        def find_cycles(depth: int, origin: NodeMeta, current: NodeMeta):
+            if depth == 0:
+                if current is origin:
+                    return [[]]
+                else:
+                    return []
+
+            cycles = []
+            for neighbor in self.adj_list()[current]:
+                neigh_cycles = find_cycles(depth - 1, origin, neighbor)
+                cycles += [
+                    [neighbor] + cycle
+                    for cycle in neigh_cycles
+                ]
+
+            return cycles
+
+        triangles = []
+        for node in self.node_meta:
+            triangles += find_cycles(3, node, node)
+
+        indices = {
+            tuple(sorted([self.to_index_mapping()[idx] for idx in tri]))
+            for tri in triangles
+        }
+
+        return list(indices)
 
 
 @dataclass(frozen=True)
@@ -135,14 +221,53 @@ def chessboard(n: int):
     return Graph(nodes, edges)
 
 
+@dataclass(frozen=True, eq=True)
+class TileSpec:
+    idx: int
+    side: Literal["A", "B"] | None = None
+    clockwise_rotations: int = 0
+
+
 @dataclass(frozen=True)
 class GameboardNode:
     idx: int
+    tile_spec: TileSpec
+    wormhole_labels: tuple[str, ...] = field(default_factory=tuple)
 
 
-def ti_board(n: int):
+def ti_board(
+    n: int,
+    tiles: list[list[TileSpec | int]] | None = None,
+    extra_connections: list[tuple[int, int]] | None = None,  # tuple of tile indices
+    wormholes: dict[str, list[int]] | None = None,
+):
     if n % 2 != 1:
         raise ValueError("Hex grid dimensions must be odd.")
+
+    idx_to_wormhole = defaultdict(list)
+    if wormholes is not None:
+        for label, group in wormholes.items():
+            for hole in group:
+                idx_to_wormhole[hole].append(label)
+
+    idx_to_wormhole = defaultdict(
+        tuple,
+        {
+            idx: tuple(wormhole_labels)
+            for idx, wormhole_labels in idx_to_wormhole.items()
+        }
+    )
+
+    if tiles is None:
+        tiles = repeat([TileSpec(1)] * ((n - 1) // 2 + 1))
+    else:
+        tiles = [
+            [
+                TileSpec(tile) if isinstance(tile, int) else tile
+                for tile in tile_row
+            ]
+            for tile_row in tiles
+        ]
 
     rows = []
     edges = []
@@ -153,42 +278,75 @@ def ti_board(n: int):
 
     num_rows = 2 * n - 1
 
-    for row_idx in range(num_rows):
+    for row_idx, tile_row in zip(range(num_rows), tiles):
         row = []
         if row_idx % 2 == (0 if first_row_odd else 1):
             num_cols = (n - 1) // 2 + 1
-            for col in range(num_cols):
-                node = GameboardNode(flat_idx)
-                row.append((flat_idx, node))
-                nodes.append(node)
-                if row_idx >= 1:
-                    if col >= 1:
-                        neibor_idx, _ = rows[row_idx - 1][col - 1]
-                        edges.append(Edge(flat_idx, neibor_idx, None))
-                    if col <= num_cols - 2:
-                        neibor_idx, _ = rows[row_idx - 1][col]
-                        edges.append(Edge(flat_idx, neibor_idx, None))
-                if row_idx >= 2:
-                    neibor_idx, _ = rows[row_idx - 2][col]
-                    edges.append(Edge(flat_idx, neibor_idx, None))
-                flat_idx += 1
+            padding = (num_cols - len(tile_row)) // 2
+            row_tiles = [None] * padding + tile_row + [None] * padding
+            # assert len(row_tiles) == num_cols, f"{num_cols=} {padding=} {len(row_tiles)=}"
+            for col, tile in zip(range(num_cols), row_tiles):
+                node = GameboardNode(flat_idx, tile)
+                if tile is not None:
+                    node = GameboardNode(flat_idx, tile, wormhole_labels=idx_to_wormhole[tile.idx])
+                    row.append((flat_idx, node))
+                    nodes.append(node)
+                else:
+                    node = None
+                    row.append((-1, node))
+                if node is not None:
+                    if row_idx >= 1:
+                        if col >= 1:
+                            neibor_idx, neighbor = rows[row_idx - 1][col - 1]
+                            if neighbor is not None:
+                                edges.append(Edge(flat_idx, neibor_idx, None))
+                        if col <= num_cols - 2:
+                            neibor_idx, neighbor = rows[row_idx - 1][col]
+                            if neighbor is not None:
+                                edges.append(Edge(flat_idx, neibor_idx, None))
+                    if row_idx >= 2:
+                        neibor_idx, neighbor = rows[row_idx - 2][col]
+                        if neighbor is not None:
+                            edges.append(Edge(flat_idx, neibor_idx, None))
+                    flat_idx += 1
         else:
             num_cols = (n - 1) // 2
-            for col in range(num_cols):
-                node = GameboardNode(flat_idx)
-                row.append((flat_idx, node))
-                nodes.append(node)
-                if row_idx >= 1:
-                    neibor_idx, _ = rows[row_idx - 1][col]
-                    edges.append(Edge(flat_idx, neibor_idx, None))
-                    if col <= num_cols - 1:
-                        neibor_idx, _ = rows[row_idx - 1][col + 1]
-                        edges.append(Edge(flat_idx, neibor_idx, None))
-                if row_idx >= 2:
-                    neibor_idx, _ = rows[row_idx - 2][col]
-                    edges.append(Edge(flat_idx, neibor_idx, None))
-                flat_idx += 1
+            padding = (num_cols - len(tile_row)) // 2
+            row_tiles = [None] * padding + tile_row + [None] * padding
+            # assert len(row_tiles) == num_cols
+            for col, tile in zip(range(num_cols), row_tiles):
+                if tile is not None:
+                    node = GameboardNode(flat_idx, tile, wormhole_labels=idx_to_wormhole[tile.idx])
+                    row.append((flat_idx, node))
+                    nodes.append(node)
+                else:
+                    node = None
+                    row.append((-1, node))
+                if node is not None:
+                    if row_idx >= 1:
+                        neibor_idx, neighbor = rows[row_idx - 1][col]
+                        if neighbor is not None:
+                            edges.append(Edge(flat_idx, neibor_idx, None))
+                        if col <= num_cols - 1:
+                            neibor_idx, neighbor = rows[row_idx - 1][col + 1]
+                            if neighbor is not None:
+                                edges.append(Edge(flat_idx, neibor_idx, None))
+                    if row_idx >= 2:
+                        neibor_idx, neighbor = rows[row_idx - 2][col]
+                        if neighbor is not None:
+                            edges.append(Edge(flat_idx, neibor_idx, None))
+                    flat_idx += 1
         rows.append(row)
+
+    if extra_connections is not None:
+        ordered_tiles = [node.tile_spec.idx for node in nodes]
+        for from_, to in extra_connections:
+            edges.append(Edge(
+                ordered_tiles.index(from_),
+                ordered_tiles.index(to),
+                None,
+            ))
+
     return Graph(nodes, edges)
 
 
@@ -198,14 +356,21 @@ class Planariser:
     num_dims: int
     loss_order: float = 2.0
     seed: int | None = None
+    starting_positions: torch.Tensor | None = None
+    optimization_speed: float = 1.0
 
     def _init_params(self):
         if self.seed is not None:
             torch.manual_seed(self.seed)
-        points = torch.nn.parameter.Parameter(
-            torch.Tensor(self.num_dims, self.graph.num_nodes)
-        )
-        torch.nn.init.normal_(points)
+        if self.starting_positions is None:
+            points = torch.nn.parameter.Parameter(
+                torch.Tensor(self.num_dims, self.graph.num_nodes)
+            )
+            torch.nn.init.normal_(points)
+        else:
+            points = torch.nn.parameter.Parameter(
+                self.starting_positions,
+            )
         return points
 
     def _step(
@@ -236,12 +401,12 @@ class Planariser:
         self,
         points,
     ):
-        return torch.optim.SGD([points])
+        return torch.optim.SGD([points], lr=0.01 * self.optimization_speed)
 
     def iter_embedddings(
         self,
         num_iterations: int = 1000,
-        iterations_per_yield: int = None,
+        iterations_per_yield: int = 1,
     ) -> npt.NDArray:
         points = self._init_params()
         graph_distances = torch.Tensor(self.graph.pairwise_distances())
@@ -279,3 +444,40 @@ class Planariser:
             pbar.set_description(f"Loss: {loss:.2e}")
 
         return points.detach()
+
+
+def load_tile(
+    tile_spec: TileSpec,
+):
+    if tile_spec.side is None:
+        suffix = ""
+    else:
+        suffix = tile_spec.side
+
+    path = f"tiles/ST_{tile_spec.idx}{suffix}.png"
+    img = Image.open(path)
+    return img.rotate(
+        -60 * tile_spec.clockwise_rotations
+    )
+
+
+def plot_tile(
+    ax,
+    tile_height,
+    xy,
+    tile_spec: TileSpec,
+):
+    tile_width = tile_height / math.cos(30 / 360 * 2 * math.pi)
+
+    x, y = xy
+    left = x - tile_width / 2
+    right = x + tile_width / 2
+    bottom = y - tile_height / 2
+    top = y + tile_height / 2
+
+    tile_im = load_tile(tile_spec)
+
+    ax.imshow(
+        tile_im,
+        extent=(left, right, bottom, top),
+    )
